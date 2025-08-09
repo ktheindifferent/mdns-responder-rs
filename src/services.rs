@@ -34,7 +34,7 @@ impl ServicesInner {
         &self.hostname
     }
 
-    pub fn find_by_name<'a>(&'a self, name: &'a Name<'a>) -> Option<&ServiceData> {
+    pub fn find_by_name<'a>(&'a self, name: &'a Name<'a>) -> Option<&'a ServiceData> {
         self.by_name.get(name).and_then(|id| self.by_id.get(id))
     }
 

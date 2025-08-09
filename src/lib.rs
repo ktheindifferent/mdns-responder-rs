@@ -17,7 +17,7 @@ use futures::Future;
 use futures::sync::mpsc;
 use std::cell::RefCell;
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use std::thread;
 use tokio::reactor::{Core, Handle};
 
@@ -50,7 +50,7 @@ pub struct Service {
     _shutdown: Arc<Shutdown>,
 }
 
-type ResponderTask = Box<Future<Item = (), Error = io::Error> + Send>;
+type ResponderTask = Box<dyn Future<Item = (), Error = io::Error> + Send>;
 
 impl Responder {
     fn setup_core() -> io::Result<(Core, ResponderTask, Responder)> {
@@ -61,7 +61,7 @@ impl Responder {
 
     pub fn new() -> io::Result<Responder> {
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("mdns-responder".to_owned())
             .spawn(move || match Self::setup_core() {
                 Ok((mut core, task, responder)) => {
@@ -73,7 +73,11 @@ impl Responder {
                 }
             })?;
 
-        rx.recv().expect("rx responder channel closed")
+        let mut responder = rx.recv().expect("rx responder channel closed")?;
+        if let Some(shutdown) = Arc::get_mut(&mut responder.shutdown) {
+            *shutdown.thread_handle.lock().unwrap() = Some(handle);
+        }
+        Ok(responder)
     }
 
     pub fn spawn(handle: &Handle) -> io::Result<Responder> {
@@ -86,7 +90,7 @@ impl Responder {
     }
 
     pub fn with_handle(handle: &Handle) -> io::Result<(Responder, ResponderTask)> {
-        let mut hostname = try!(net::gethostname());
+        let mut hostname = net::gethostname()?;
         if !hostname.ends_with(".local") {
             hostname.push_str(".local");
         }
@@ -117,7 +121,10 @@ impl Responder {
         let responder = Responder {
             services: services,
             commands: RefCell::new(commands.clone()),
-            shutdown: Arc::new(Shutdown(commands)),
+            shutdown: Arc::new(Shutdown {
+                commands: commands.clone(),
+                thread_handle: Mutex::new(None),
+            }),
         };
 
         Ok((responder, task))
@@ -169,12 +176,18 @@ impl Drop for Service {
     }
 }
 
-struct Shutdown(CommandSender);
+struct Shutdown {
+    commands: CommandSender,
+    thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
 
 impl Drop for Shutdown {
     fn drop(&mut self) {
-        self.0.send_shutdown();
-        // TODO wait for tasks to shutdown
+        self.commands.clone().send_shutdown();
+        // Wait for the thread to finish
+        if let Some(handle) = self.thread_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 }
 

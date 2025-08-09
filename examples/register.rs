@@ -1,5 +1,5 @@
 extern crate env_logger;
-extern crate mdns;
+extern crate mdns_responder_rs as mdns;
 
 pub fn main() {
     env_logger::init();

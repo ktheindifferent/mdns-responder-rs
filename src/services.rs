@@ -1,3 +1,8 @@
+//! Service registry for mDNS responder.
+//!
+//! This module manages the collection of services that are advertised
+//! via mDNS, including their names, types, ports, and TXT records.
+
 use dns_parser::{self, Name, QueryClass, RRData};
 use multimap::MultiMap;
 use rand::{thread_rng, Rng};
@@ -5,11 +10,15 @@ use std::collections::HashMap;
 use std::slice;
 use std::sync::{Arc, RwLock};
 
+/// Type alias for DNS answer builder
 pub type AnswerBuilder = dns_parser::Builder<dns_parser::Answers>;
 
-/// A collection of registered services is shared between threads.
+/// Thread-safe collection of registered services
 pub type Services = Arc<RwLock<ServicesInner>>;
 
+/// The internal service registry.
+///
+/// Maintains multiple indices for efficient service lookup by ID, name, and type.
 pub struct ServicesInner {
     hostname: Name<'static>,
     /// main index
@@ -21,32 +30,38 @@ pub struct ServicesInner {
 }
 
 impl ServicesInner {
+    /// Creates a new service registry with the given hostname.
     pub fn new(hostname: String) -> Self {
         ServicesInner {
-            hostname: Name::from_str(hostname).unwrap(),
+            hostname: Name::from_str(hostname)
+                .expect("Invalid hostname format"),
             by_id: HashMap::new(),
             by_type: MultiMap::new(),
             by_name: HashMap::new(),
         }
     }
 
+    /// Returns the hostname for this mDNS responder.
     pub fn get_hostname(&self) -> &Name<'static> {
         &self.hostname
     }
 
+    /// Finds a service by its fully qualified domain name.
     pub fn find_by_name<'a>(&'a self, name: &'a Name<'a>) -> Option<&'a ServiceData> {
         self.by_name.get(name).and_then(|id| self.by_id.get(id))
     }
 
+    /// Returns an iterator over all services of the given type.
     pub fn find_by_type<'a>(&'a self, ty: &'a Name<'a>) -> FindByType<'a> {
         let ids = self.by_type.get_vec(ty).map(|ids| ids.iter());
 
         FindByType {
             services: self,
-            ids: ids,
+            ids,
         }
     }
 
+    /// Registers a new service and returns its unique ID.
     pub fn register(&mut self, svc: ServiceData) -> usize {
         let mut id = thread_rng().gen::<usize>();
         while self.by_id.contains_key(&id) {
@@ -60,24 +75,20 @@ impl ServicesInner {
         id
     }
 
+    /// Unregisters a service by ID and returns its data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the service ID doesn't exist.
     pub fn unregister(&mut self, id: usize) -> ServiceData {
-        use std::collections::hash_map::Entry;
-
         let svc = self.by_id.remove(&id).expect("unknown service");
 
         if let Some(entries) = self.by_type.get_vec_mut(&svc.typ) {
             entries.retain(|&e| e != id);
         }
 
-        match self.by_name.entry(svc.name.clone()) {
-            Entry::Occupied(entry) => {
-                assert_eq!(*entry.get(), id);
-                entry.remove();
-            }
-            _ => {
-                panic!("unknown/wrong service for id {}", id);
-            }
-        }
+        let removed = self.by_name.remove(&svc.name);
+        assert_eq!(removed, Some(id), "Service name index mismatch for id {id}");
 
         svc
     }
@@ -93,13 +104,13 @@ impl<'a> Iterator for FindByType<'a> {
     type Item = &'a ServiceData;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.ids.as_mut().and_then(Iterator::next).map(|id| {
-            let svc = self.services.by_id.get(id);
-            svc.expect("missing service")
-        })
+        self.ids.as_mut()?
+            .next()
+            .and_then(|id| self.services.by_id.get(id))
     }
 }
 
+/// Data for a single mDNS service.
 #[derive(Clone, Debug)]
 pub struct ServiceData {
     pub name: Name<'static>,
@@ -108,8 +119,8 @@ pub struct ServiceData {
     pub txt: Vec<u8>,
 }
 
-/// Packet building helpers for `fsm` to respond with `ServiceData`
 impl ServiceData {
+    /// Adds a PTR record for this service to the answer builder.
     pub fn add_ptr_rr(&self, builder: AnswerBuilder, ttl: u32) -> AnswerBuilder {
         builder.add_answer(
             &self.typ,
@@ -119,6 +130,7 @@ impl ServiceData {
         )
     }
 
+    /// Adds an SRV record for this service to the answer builder.
     pub fn add_srv_rr(&self, hostname: &Name, builder: AnswerBuilder, ttl: u32) -> AnswerBuilder {
         builder.add_answer(
             &self.name,
@@ -133,6 +145,7 @@ impl ServiceData {
         )
     }
 
+    /// Adds a TXT record for this service to the answer builder.
     pub fn add_txt_rr(&self, builder: AnswerBuilder, ttl: u32) -> AnswerBuilder {
         builder.add_answer(&self.name, QueryClass::IN, ttl, &RRData::TXT(&self.txt))
     }

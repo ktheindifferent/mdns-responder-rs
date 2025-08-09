@@ -1,16 +1,31 @@
-#[macro_use]
-extern crate log;
+//! A multicast DNS (mDNS) responder library for Rust.
+//!
+//! This library allows you to register and advertise services on the local network
+//! using multicast DNS (mDNS/Bonjour/Avahi). Services can be discovered by other
+//! devices on the same network without requiring a central DNS server.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use mdns_responder_rs as mdns;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let responder = mdns::Responder::new()?;
+//! let _service = responder.register(
+//!     "_http._tcp".to_owned(),
+//!     "My Web Server".to_owned(),
+//!     8080,
+//!     &["path=/", "version=1.0"],
+//! );
+//!
+//! // Service will be advertised until it goes out of scope
+//! std::thread::sleep(std::time::Duration::from_secs(60));
+//! # Ok(())
+//! # }
+//! ```
 
-extern crate byteorder;
-extern crate dns_parser;
-extern crate futures;
-extern crate get_if_addrs;
-extern crate libc;
-extern crate multimap;
-extern crate net2;
-extern crate nix;
-extern crate rand;
-extern crate tokio_core as tokio;
+use log::{error, warn};
+use tokio_core as tokio;
 
 use dns_parser::Name;
 use futures::Future;
@@ -30,19 +45,32 @@ mod net;
 mod net;
 mod services;
 
-use address_family::{Inet, Inet6};
-use fsm::{Command, FSM};
-use services::{ServiceData, Services, ServicesInner};
+use crate::address_family::{Inet, Inet6};
+use crate::fsm::{Command, FSM};
+use crate::services::{ServiceData, Services, ServicesInner};
 
+/// Default Time-To-Live for DNS records (in seconds)
 const DEFAULT_TTL: u32 = 60;
+
+/// Standard mDNS port number
 const MDNS_PORT: u16 = 5353;
 
+/// The main mDNS responder that manages service registration and advertisement.
+///
+/// The `Responder` handles all mDNS network communication and maintains a registry
+/// of advertised services. It runs a background thread to handle mDNS queries and
+/// responses.
 pub struct Responder {
     services: Services,
     commands: RefCell<CommandSender>,
     shutdown: Arc<Shutdown>,
 }
 
+/// A handle to a registered mDNS service.
+///
+/// When this handle is dropped, the service will be unregistered and will stop
+/// being advertised on the network. Keep this handle alive as long as you want
+/// the service to be discoverable.
 pub struct Service {
     id: usize,
     services: Services,
@@ -53,12 +81,25 @@ pub struct Service {
 type ResponderTask = Box<dyn Future<Item = (), Error = io::Error> + Send>;
 
 impl Responder {
+    /// Internal helper to set up the tokio event loop core
     fn setup_core() -> io::Result<(Core, ResponderTask, Responder)> {
         let core = Core::new()?;
         let (responder, task) = Self::with_handle(&core.handle())?;
         Ok((core, task, responder))
     }
 
+    /// Creates a new mDNS responder with its own background thread.
+    ///
+    /// This will spawn a dedicated thread for handling mDNS traffic.
+    /// The responder will automatically bind to the mDNS multicast addresses
+    /// for both IPv4 and IPv6 if available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The mDNS port (5353) is already in use
+    /// - Network interfaces cannot be accessed
+    /// - The background thread fails to start
     pub fn new() -> io::Result<Responder> {
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
         let handle = thread::Builder::new()
@@ -80,15 +121,31 @@ impl Responder {
         Ok(responder)
     }
 
+    /// Creates a new mDNS responder using an existing tokio event loop.
+    ///
+    /// This is useful when you already have a tokio runtime and want to
+    /// integrate the mDNS responder into it.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - A handle to the tokio reactor where tasks will be spawned
     pub fn spawn(handle: &Handle) -> io::Result<Responder> {
         let (responder, task) = Responder::with_handle(handle)?;
         handle.spawn(task.map_err(|e| {
-            warn!("mdns error {:?}", e);
-            ()
+            warn!("mdns error {e:?}");
+            
         }));
         Ok(responder)
     }
 
+    /// Creates a new mDNS responder with a custom tokio handle.
+    ///
+    /// Returns both the responder and the future that must be driven to
+    /// handle mDNS traffic. This gives you full control over task execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - A handle to the tokio reactor
     pub fn with_handle(handle: &Handle) -> io::Result<(Responder, ResponderTask)> {
         let mut hostname = net::gethostname()?;
         if !hostname.ends_with(".local") {
@@ -110,7 +167,7 @@ impl Responder {
             }
 
             (Ok((v4_task, v4_command)), Err(err)) => {
-                warn!("Failed to register IPv6 receiver: {:?}", err);
+                warn!("Failed to register IPv6 receiver: {err:?}");
                 (Box::new(v4_task), vec![v4_command])
             }
 
@@ -119,7 +176,7 @@ impl Responder {
 
         let commands = CommandSender(commands);
         let responder = Responder {
-            services: services,
+            services,
             commands: RefCell::new(commands.clone()),
             shutdown: Arc::new(Shutdown {
                 commands: commands.clone(),
@@ -131,27 +188,55 @@ impl Responder {
     }
 }
 
+/// Builds a properly formatted TXT record from string entries.
+///
+/// Each entry is prefixed with its length as required by DNS TXT records.
+/// Empty entries result in a single zero byte.
+fn build_txt_record(entries: &[&str]) -> Vec<u8> {
+    if entries.is_empty() {
+        vec![0]
+    } else {
+        entries.iter()
+            .flat_map(|entry| {
+                let bytes = entry.as_bytes();
+                if bytes.len() > 255 {
+                    panic!("TXT record entry '{}' is too long (max 255 bytes)", entry);
+                }
+                std::iter::once(bytes.len() as u8)
+                    .chain(bytes.iter().cloned())
+            })
+            .collect()
+    }
+}
+
 impl Responder {
+    /// Registers a new service to be advertised via mDNS.
+    ///
+    /// # Arguments
+    ///
+    /// * `svc_type` - The service type (e.g., "_http._tcp")
+    /// * `svc_name` - The human-readable service name
+    /// * `port` - The port number where the service is listening
+    /// * `txt` - TXT record entries as key=value pairs
+    ///
+    /// # Returns
+    ///
+    /// A `Service` handle that keeps the service registered. The service will
+    /// be automatically unregistered when this handle is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any TXT record entry is longer than 255 bytes.
     pub fn register(&self, svc_type: String, svc_name: String, port: u16, txt: &[&str]) -> Service {
-        let txt = if txt.is_empty() {
-            vec![0]
-        } else {
-            txt.into_iter()
-                .flat_map(|entry| {
-                    let entry = entry.as_bytes();
-                    if entry.len() > 255 {
-                        panic!("{:?} is too long for a TXT record", entry);
-                    }
-                    std::iter::once(entry.len() as u8).chain(entry.into_iter().cloned())
-                })
-                .collect()
-        };
+        let txt = build_txt_record(txt);
 
         let svc = ServiceData {
-            typ: Name::from_str(format!("{}.local", svc_type)).unwrap(),
-            name: Name::from_str(format!("{}.{}.local", svc_name, svc_type)).unwrap(),
-            port: port,
-            txt: txt,
+            typ: Name::from_str(format!("{svc_type}.local"))
+                .expect("Invalid service type format"),
+            name: Name::from_str(format!("{svc_name}.{svc_type}.local"))
+                .expect("Invalid service name format"),
+            port,
+            txt,
         };
 
         self.commands
@@ -161,7 +246,7 @@ impl Responder {
         let id = self.services.write().unwrap().register(svc);
 
         Service {
-            id: id,
+            id,
             commands: self.commands.borrow().clone(),
             services: self.services.clone(),
             _shutdown: self.shutdown.clone(),
@@ -196,15 +281,17 @@ struct CommandSender(Vec<mpsc::UnboundedSender<Command>>);
 impl CommandSender {
     fn send(&mut self, cmd: Command) {
         for tx in self.0.iter_mut() {
-            tx.unbounded_send(cmd.clone()).expect("responder died");
+            if let Err(e) = tx.unbounded_send(cmd.clone()) {
+                error!("Failed to send command to responder: {e:?}");
+            }
         }
     }
 
     fn send_unsolicited(&mut self, svc: ServiceData, ttl: u32, include_ip: bool) {
         self.send(Command::SendUnsolicited {
-            svc: svc,
-            ttl: ttl,
-            include_ip: include_ip,
+            svc,
+            ttl,
+            include_ip,
         });
     }
 

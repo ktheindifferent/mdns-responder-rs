@@ -1,5 +1,4 @@
-extern crate env_logger;
-extern crate mdns_responder_rs as mdns;
+use mdns_responder_rs as mdns;
 
 pub fn main() {
     env_logger::init();
@@ -13,6 +12,6 @@ pub fn main() {
     );
 
     loop {
-        ::std::thread::sleep(::std::time::Duration::from_secs(10));
+        std::thread::sleep(std::time::Duration::from_secs(10));
     }
 }

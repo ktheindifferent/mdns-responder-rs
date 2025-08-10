@@ -9,7 +9,7 @@
    - `Service`: Represents a registered service
    - `Shutdown`: Handles graceful shutdown with thread synchronization
 
-2. **fsm.rs** - Finite State Machine for mDNS protocol
+2. **fsm.rs** - Finite State Machine (Fsm) for mDNS protocol
    - Handles incoming mDNS queries
    - Sends mDNS responses
    - Manages command processing

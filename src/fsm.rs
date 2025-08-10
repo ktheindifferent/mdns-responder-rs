@@ -34,7 +34,7 @@ pub enum Command {
 }
 
 /// The main state machine for handling mDNS operations.
-pub struct FSM<AF: AddressFamily> {
+pub struct Fsm<AF: AddressFamily> {
     socket: UdpSocket,
     services: Services,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -42,17 +42,17 @@ pub struct FSM<AF: AddressFamily> {
     _af: PhantomData<AF>,
 }
 
-impl<AF: AddressFamily> FSM<AF> {
-    /// Creates a new FSM for the given address family.
+impl<AF: AddressFamily> Fsm<AF> {
+    /// Creates a new Fsm for the given address family.
     pub fn new(
         handle: &Handle,
         services: &Services,
-    ) -> io::Result<(FSM<AF>, mpsc::UnboundedSender<Command>)> {
+    ) -> io::Result<(Fsm<AF>, mpsc::UnboundedSender<Command>)> {
         let std_socket = AF::bind()?;
         let socket = UdpSocket::from_socket(std_socket, handle)?;
         let (tx, rx) = mpsc::unbounded();
 
-        let fsm = FSM {
+        let fsm = Fsm {
             socket,
             services: services.clone(),
             commands: rx,
@@ -238,7 +238,7 @@ impl<AF: AddressFamily> FSM<AF> {
     }
 }
 
-impl<AF: AddressFamily> Future for FSM<AF> {
+impl<AF: AddressFamily> Future for Fsm<AF> {
     type Item = ();
     type Error = io::Error;
     fn poll(&mut self) -> Poll<(), io::Error> {

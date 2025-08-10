@@ -46,7 +46,7 @@ mod net;
 mod services;
 
 use crate::address_family::{Inet, Inet6};
-use crate::fsm::{Command, FSM};
+use crate::fsm::{Command, Fsm};
 use crate::services::{ServiceData, Services, ServicesInner};
 
 /// Default Time-To-Live for DNS records (in seconds)
@@ -154,8 +154,8 @@ impl Responder {
 
         let services = Arc::new(RwLock::new(ServicesInner::new(hostname)));
 
-        let v4 = FSM::<Inet>::new(handle, &services);
-        let v6 = FSM::<Inet6>::new(handle, &services);
+        let v4 = Fsm::<Inet>::new(handle, &services);
+        let v6 = Fsm::<Inet6>::new(handle, &services);
 
         let (task, commands): (ResponderTask, _) = match (v4, v6) {
             (Ok((v4_task, v4_command)), Ok((v6_task, v6_command))) => {
@@ -297,5 +297,62 @@ impl CommandSender {
 
     fn send_shutdown(&mut self) {
         self.send(Command::Shutdown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_txt_record_empty() {
+        let result = build_txt_record(&[]);
+        assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn test_build_txt_record_single_entry() {
+        let result = build_txt_record(&["key=value"]);
+        let expected = vec![9, b'k', b'e', b'y', b'=', b'v', b'a', b'l', b'u', b'e'];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_build_txt_record_multiple_entries() {
+        let result = build_txt_record(&["a=1", "b=2"]);
+        let expected = vec![3, b'a', b'=', b'1', 3, b'b', b'=', b'2'];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_build_txt_record_empty_string_entry() {
+        let result = build_txt_record(&[""]);
+        assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn test_build_txt_record_max_length_entry() {
+        let long_string = "a".repeat(255);
+        let result = build_txt_record(&[&long_string]);
+        assert_eq!(result[0], 255);
+        assert_eq!(result.len(), 256);
+        assert_eq!(&result[1..], long_string.as_bytes());
+    }
+
+    #[test]
+    #[should_panic(expected = "TXT record entry")]
+    fn test_build_txt_record_too_long_entry() {
+        let too_long = "a".repeat(256);
+        build_txt_record(&[&too_long]);
+    }
+
+    #[test]
+    fn test_build_txt_record_special_characters() {
+        let result = build_txt_record(&["path=/api", "version=1.0.0"]);
+        let expected = vec![
+            9, b'p', b'a', b't', b'h', b'=', b'/', b'a', b'p', b'i',
+            13, b'v', b'e', b'r', b's', b'i', b'o', b'n', b'=', b'1', b'.', b'0', b'.', b'0'
+        ];
+        assert_eq!(result, expected);
     }
 }

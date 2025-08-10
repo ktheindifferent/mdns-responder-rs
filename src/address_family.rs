@@ -15,7 +15,7 @@ pub trait AddressFamily {
         builder.reuse_address(true)?;
         #[cfg(not(windows))]
         let _ = builder.reuse_port(true);
-        let socket = builder.bind(&addr)?;
+        let socket = builder.bind(addr)?;
         Self::join_multicast(&socket)?;
         Ok(socket)
     }

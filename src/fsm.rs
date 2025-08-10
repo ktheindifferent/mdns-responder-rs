@@ -1,21 +1,28 @@
+//! Finite State Machine for handling mDNS protocol operations.
+//!
+//! This module implements the core mDNS protocol logic, including
+//! handling queries, sending responses, and managing network I/O.
+
 use dns_parser::{self, Name, QueryClass, QueryType, RRData};
 use futures::sync::mpsc;
 use futures::{Async, Future, Poll, Stream};
 use get_if_addrs::get_if_addrs;
+use log::{debug, error, trace, warn};
 use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind::WouldBlock;
 use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr};
-use tokio::net::UdpSocket;
-use tokio::reactor::Handle;
+use tokio_core::net::UdpSocket;
+use tokio_core::reactor::Handle;
 
-use super::{DEFAULT_TTL, MDNS_PORT};
-use address_family::AddressFamily;
-use services::{ServiceData, Services};
+use crate::{DEFAULT_TTL, MDNS_PORT};
+use crate::address_family::AddressFamily;
+use crate::services::{ServiceData, Services};
 
 pub type AnswerBuilder = dns_parser::Builder<dns_parser::Answers>;
 
+/// Commands that can be sent to the FSM.
 #[derive(Clone, Debug)]
 pub enum Command {
     SendUnsolicited {
@@ -26,6 +33,7 @@ pub enum Command {
     Shutdown,
 }
 
+/// The main state machine for handling mDNS operations.
 pub struct FSM<AF: AddressFamily> {
     socket: UdpSocket,
     services: Services,
@@ -35,6 +43,7 @@ pub struct FSM<AF: AddressFamily> {
 }
 
 impl<AF: AddressFamily> FSM<AF> {
+    /// Creates a new FSM for the given address family.
     pub fn new(
         handle: &Handle,
         services: &Services,
@@ -44,7 +53,7 @@ impl<AF: AddressFamily> FSM<AF> {
         let (tx, rx) = mpsc::unbounded();
 
         let fsm = FSM {
-            socket: socket,
+            socket,
             services: services.clone(),
             commands: rx,
             outgoing: VecDeque::new(),
@@ -64,7 +73,7 @@ impl<AF: AddressFamily> FSM<AF> {
             };
 
             if bytes >= buf.len() {
-                warn!("buffer too small for packet from {:?}", addr);
+                warn!("buffer too small for packet from {addr:?}");
                 continue;
             }
 
@@ -74,23 +83,23 @@ impl<AF: AddressFamily> FSM<AF> {
     }
 
     fn handle_packet(&mut self, buffer: &[u8], addr: SocketAddr) {
-        trace!("received packet from {:?}", addr);
+        trace!("received packet from {addr:?}");
 
         let packet = match dns_parser::Packet::parse(buffer) {
             Ok(packet) => packet,
             Err(error) => {
-                warn!("couldn't parse packet from {:?}: {}", addr, error);
+                warn!("couldn't parse packet from {addr:?}: {error}");
                 return;
             }
         };
 
         if !packet.header.query {
-            trace!("received packet from {:?} with no query", addr);
+            trace!("received packet from {addr:?} with no query");
             return;
         }
 
         if packet.header.truncated {
-            warn!("dropping truncated packet from {:?}", addr);
+            warn!("dropping truncated packet from {addr:?}");
             return;
         }
 
@@ -133,7 +142,13 @@ impl<AF: AddressFamily> FSM<AF> {
         question: &dns_parser::Question,
         mut builder: AnswerBuilder,
     ) -> AnswerBuilder {
-        let services = self.services.read().unwrap();
+        let services = match self.services.read() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to acquire services lock: {e:?}");
+                return builder;
+            }
+        };
 
         match question.qtype {
             QueryType::A | QueryType::AAAA | QueryType::All
@@ -170,7 +185,7 @@ impl<AF: AddressFamily> FSM<AF> {
         let interfaces = match get_if_addrs() {
             Ok(interfaces) => interfaces,
             Err(err) => {
-                error!("could not get list of interfaces: {}", err);
+                error!("could not get list of interfaces: {err}");
                 return builder;
             }
         };
@@ -180,7 +195,7 @@ impl<AF: AddressFamily> FSM<AF> {
                 continue;
             }
 
-            trace!("found interface {:?}", iface);
+            trace!("found interface {iface:?}");
             match iface.ip() {
                 IpAddr::V4(ip) if !AF::v6() => {
                     builder = builder.add_answer(hostname, QueryClass::IN, ttl, &RRData::A(ip))
@@ -200,7 +215,13 @@ impl<AF: AddressFamily> FSM<AF> {
             dns_parser::Builder::new_response(0, false).move_to::<dns_parser::Answers>();
         builder.set_max_size(None);
 
-        let services = self.services.read().unwrap();
+        let services = match self.services.read() {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to acquire services lock: {e:?}");
+                return;
+            }
+        };
 
         builder = svc.add_ptr_rr(builder, ttl);
         builder = svc.add_srv_rr(services.get_hostname(), builder, ttl);
@@ -221,7 +242,8 @@ impl<AF: AddressFamily> Future for FSM<AF> {
     type Item = ();
     type Error = io::Error;
     fn poll(&mut self) -> Poll<(), io::Error> {
-        while let Async::Ready(cmd) = self.commands.poll().unwrap() {
+        // Process commands from the channel
+        while let Ok(Async::Ready(cmd)) = self.commands.poll() {
             match cmd {
                 Some(Command::Shutdown) => return Ok(Async::Ready(())),
                 Some(Command::SendUnsolicited {
@@ -242,17 +264,13 @@ impl<AF: AddressFamily> Future for FSM<AF> {
             self.recv_packets()?;
         }
 
-        loop {
-            if let Some(&(ref response, ref addr)) = self.outgoing.front() {
-                trace!("sending packet to {:?}", addr);
+        while let Some((response, addr)) = self.outgoing.front() {
+            trace!("sending packet to {addr:?}");
 
-                match self.socket.send_to(response, addr) {
-                    Ok(_) => (),
-                    Err(ref ioerr) if ioerr.kind() == WouldBlock => break,
-                    Err(err) => warn!("error sending packet {:?}", err),
-                }
-            } else {
-                break;
+            match self.socket.send_to(response, addr) {
+                Ok(_) => (),
+                Err(ref ioerr) if ioerr.kind() == WouldBlock => break,
+                Err(err) => warn!("error sending packet {err:?}"),
             }
 
             self.outgoing.pop_front();

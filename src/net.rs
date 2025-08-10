@@ -1,10 +1,7 @@
-use libc;
-use std;
 
 pub fn gethostname() -> std::io::Result<String> {
     unsafe {
-        let mut name = Vec::new();
-        name.resize(65, 0u8);
+        let mut name = vec![0; 65];
 
         let ptr = name.as_mut_ptr() as *mut libc::c_char;
         let cap = name.len() as libc::size_t;

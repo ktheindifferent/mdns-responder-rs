@@ -150,3 +150,128 @@ impl ServiceData {
         builder.add_answer(&self.name, QueryClass::IN, ttl, &RRData::TXT(&self.txt))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_service(name: &str, typ: &str, port: u16) -> ServiceData {
+        ServiceData {
+            name: Name::from_str(format!("{}.{}.local", name, typ))
+                .expect("Invalid test name"),
+            typ: Name::from_str(format!("{}.local", typ))
+                .expect("Invalid test type"),
+            port,
+            txt: vec![0],
+        }
+    }
+
+    #[test]
+    fn test_services_inner_new() {
+        let services = ServicesInner::new("test-host.local".to_string());
+        assert_eq!(services.get_hostname().to_string(), "test-host.local");
+        assert_eq!(services.by_id.len(), 0);
+        assert_eq!(services.by_name.len(), 0);
+    }
+
+    #[test]
+    fn test_register_service() {
+        let mut services = ServicesInner::new("test-host.local".to_string());
+        let svc = create_test_service("myservice", "_http._tcp", 8080);
+        
+        let id = services.register(svc.clone());
+        
+        assert!(services.by_id.contains_key(&id));
+        assert_eq!(services.by_id.len(), 1);
+        assert_eq!(services.by_name.len(), 1);
+        assert!(services.by_name.contains_key(&svc.name));
+    }
+
+    #[test]
+    fn test_unregister_service() {
+        let mut services = ServicesInner::new("test-host.local".to_string());
+        let svc = create_test_service("myservice", "_http._tcp", 8080);
+        
+        let id = services.register(svc.clone());
+        assert_eq!(services.by_id.len(), 1);
+        
+        let unregistered = services.unregister(id);
+        assert_eq!(unregistered.name, svc.name);
+        assert_eq!(unregistered.port, svc.port);
+        assert_eq!(services.by_id.len(), 0);
+        assert_eq!(services.by_name.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown service")]
+    fn test_unregister_unknown_service() {
+        let mut services = ServicesInner::new("test-host.local".to_string());
+        services.unregister(12345);
+    }
+
+    #[test]
+    fn test_find_by_name() {
+        let mut services = ServicesInner::new("test-host.local".to_string());
+        let svc1 = create_test_service("service1", "_http._tcp", 8080);
+        let svc2 = create_test_service("service2", "_http._tcp", 8081);
+        
+        services.register(svc1.clone());
+        services.register(svc2.clone());
+        
+        let found = services.find_by_name(&svc1.name);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().port, 8080);
+        
+        let unknown_name = Name::from_str("unknown.local").unwrap();
+        let not_found = services.find_by_name(&unknown_name);
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_find_by_type() {
+        let mut services = ServicesInner::new("test-host.local".to_string());
+        let http1 = create_test_service("web1", "_http._tcp", 8080);
+        let http2 = create_test_service("web2", "_http._tcp", 8081);
+        let ssh = create_test_service("ssh", "_ssh._tcp", 22);
+        
+        services.register(http1.clone());
+        services.register(http2.clone());
+        services.register(ssh.clone());
+        
+        let http_services: Vec<_> = services.find_by_type(&http1.typ).collect();
+        assert_eq!(http_services.len(), 2);
+        
+        let ssh_services: Vec<_> = services.find_by_type(&ssh.typ).collect();
+        assert_eq!(ssh_services.len(), 1);
+        assert_eq!(ssh_services[0].port, 22);
+        
+        let unknown_type = Name::from_str("_unknown._tcp.local").unwrap();
+        let unknown_services: Vec<_> = services.find_by_type(&unknown_type).collect();
+        assert_eq!(unknown_services.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_services_same_type() {
+        let mut services = ServicesInner::new("test-host.local".to_string());
+        
+        for i in 0..5 {
+            let svc = create_test_service(&format!("service{}", i), "_http._tcp", 8080 + i);
+            services.register(svc);
+        }
+        
+        let http_type = Name::from_str("_http._tcp.local").unwrap();
+        let found: Vec<_> = services.find_by_type(&http_type).collect();
+        assert_eq!(found.len(), 5);
+    }
+
+    #[test]
+    fn test_service_data_clone() {
+        let svc = create_test_service("test", "_http._tcp", 8080);
+        let cloned = svc.clone();
+        
+        assert_eq!(svc.name, cloned.name);
+        assert_eq!(svc.typ, cloned.typ);
+        assert_eq!(svc.port, cloned.port);
+        assert_eq!(svc.txt, cloned.txt);
+    }
+}
